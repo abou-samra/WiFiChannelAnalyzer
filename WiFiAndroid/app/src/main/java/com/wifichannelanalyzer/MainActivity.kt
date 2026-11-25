@@ -8,6 +8,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
 import android.os.Bundle
@@ -19,6 +22,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
+import java.net.Inet4Address
 
 class MainActivity : AppCompatActivity() {
 
@@ -26,7 +30,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scanButton: Button
     private lateinit var status: TextView
     private lateinit var results: LinearLayout
+    private lateinit var gatewayAddress: TextView
+    private lateinit var openRouterButton: Button
+
     private var receiverRegistered = false
+    private var currentGateway: String? = null
 
     private val scanReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -44,11 +52,23 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
         wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         scanButton = findViewById(R.id.scanButton)
         status = findViewById(R.id.status)
         results = findViewById(R.id.results)
+        gatewayAddress = findViewById(R.id.gatewayAddress)
+        openRouterButton = findViewById(R.id.openRouterButton)
+
         scanButton.setOnClickListener { onScanClicked() }
+        openRouterButton.setOnClickListener { openRouter() }
+
+        updateGateway()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateGateway()
     }
 
     override fun onStart() {
@@ -69,11 +89,66 @@ class MainActivity : AppCompatActivity() {
         super.onStop()
     }
 
+    private fun updateGateway() {
+        val connectivity = getSystemService(
+            Context.CONNECTIVITY_SERVICE
+        ) as ConnectivityManager
+
+        val network = connectivity.activeNetwork
+        val capabilities = network?.let {
+            connectivity.getNetworkCapabilities(it)
+        }
+
+        if (network == null ||
+            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true
+        ) {
+            currentGateway = null
+            gatewayAddress.text = "No Wi-Fi connection detected."
+            openRouterButton.isEnabled = false
+            return
+        }
+
+        val properties = connectivity.getLinkProperties(network)
+
+        val gateway = properties?.routes
+            ?.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }
+            ?.gateway
+            ?.hostAddress
+
+        currentGateway = gateway
+
+        if (gateway != null) {
+            gatewayAddress.text = "Gateway IP: $gateway"
+            openRouterButton.isEnabled = true
+        } else {
+            gatewayAddress.text = "Could not detect the router gateway."
+            openRouterButton.isEnabled = false
+        }
+    }
+
+    private fun openRouter() {
+        val gateway = currentGateway ?: return
+
+        val intent = Intent(
+            Intent.ACTION_VIEW,
+            Uri.parse("http://$gateway")
+        )
+
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            gatewayAddress.text =
+                "Gateway: $gateway\nNo browser is available to open this address."
+        }
+    }
+
     private fun onScanClicked() {
         val granted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
-        if (granted) startScan() else permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        if (granted) startScan()
+        else permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
     @Suppress("DEPRECATION")
@@ -82,15 +157,18 @@ class MainActivity : AppCompatActivity() {
             status.text = "Wi-Fi is turned off. Turn it on and scan again."
             return
         }
+
         val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
         if (!LocationManagerCompat.isLocationEnabled(lm)) {
             status.text = "Android needs Location switched on to list Wi-Fi networks. " +
                 "Turn it on in quick settings and scan again."
             return
         }
+
         status.text = "Scanning nearby access points..."
+
         if (!wifi.startScan()) {
-            // Android limits how often apps may scan; fall back to the latest cached results.
             status.text = "Android limited the scan rate, showing the most recent results. " +
                 "Wait a minute and try again for a fresh scan."
             showResults(readScan())
@@ -104,8 +182,11 @@ class MainActivity : AppCompatActivity() {
         } catch (e: SecurityException) {
             emptyList()
         }
+
         return raw.mapNotNull { r ->
-            val ch = ChannelAnalyzer.channelFromFrequency(r.frequency) ?: return@mapNotNull null
+            val ch = ChannelAnalyzer.channelFromFrequency(r.frequency)
+                ?: return@mapNotNull null
+
             AccessPoint(
                 ssid = r.SSID.ifBlank { "(hidden)" },
                 bssid = r.BSSID ?: "",
@@ -118,19 +199,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun showResults(aps: List<AccessPoint>) {
         results.removeAllViews()
+
         if (aps.isEmpty()) {
             status.text = "No networks found. Make sure Wi-Fi and Location are on, then scan again."
             return
         }
+
         status.text = "Found ${aps.size} access points."
 
         val r24 = ChannelAnalyzer.rank24(aps)
         val has24 = aps.any(ChannelAnalyzer::is24)
+
         addHeader("2.4 GHz")
+
         if (has24) {
             addBig("Best channel: ${r24[0].channel}")
             addText("Ranking (lower score = less crowded):")
-            r24.forEach { addText("  Channel ${it.channel}   score ${it.score}") }
+            r24.forEach {
+                addText("  Channel ${it.channel}   score ${it.score}")
+            }
             addText("Tip: use a 20 MHz channel width on 2.4 GHz.")
         } else {
             addText("No 2.4 GHz networks detected.")
@@ -138,20 +225,30 @@ class MainActivity : AppCompatActivity() {
 
         val r5 = ChannelAnalyzer.rank5(aps)
         val has5 = aps.any(ChannelAnalyzer::is5)
+
         addHeader("5 GHz")
+
         if (has5) {
             addBig("Best channel: ${r5[0].channel}")
             addText("Top 5 (lower score = less crowded):")
+
             r5.take(5).forEach {
-                addText("  Channel ${it.channel}   score ${it.score}" + if (it.dfs) "   (DFS)" else "")
+                addText(
+                    "  Channel ${it.channel}   score ${it.score}" +
+                        if (it.dfs) "   (DFS)" else ""
+                )
             }
-            addText("Check that your router supports the channel and that it is allowed in your country. " +
-                "DFS channels may be paused if radar is detected.")
+
+            addText(
+                "Check that your router supports the channel and that it is allowed in your country. " +
+                    "DFS channels may be paused if radar is detected."
+            )
         } else {
             addText("No 5 GHz networks detected (or this phone can't scan 5 GHz).")
         }
 
         addHeader("Detected networks")
+
         aps.sortedWith(compareBy({ it.channel }, { -it.signalPct })).forEach {
             addText("Ch ${it.channel}  |  ${it.signalPct}%  |  ${it.ssid}")
         }
@@ -192,5 +289,6 @@ class MainActivity : AppCompatActivity() {
         results.addView(tv)
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) =
+        (v * resources.displayMetrics.density).toInt()
 }
